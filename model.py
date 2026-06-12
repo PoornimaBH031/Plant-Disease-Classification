@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 import numpy as np
-import timm
+from timm.models.swin_transformer import SwinTransformerBlock
 
 # ==========================================================
 # FFT FEATURE EXTRACTION MODULE
@@ -45,9 +45,25 @@ class FFTModule(nn.Module):
 
         fft_filtered = fft * mask
 
-        magnitude = torch.abs(fft_filtered)
+        #==================================
+        # INVERSE FFT RECONSTRUCTION
+        #==================================
 
-        freq_features = self.conv1x1(magnitude)
+        ifft = torch.fft.ifftshift(
+            fft_filtered
+        )
+
+        reconstructed = torch.fft.ifft2(
+            ifft
+        )
+
+        reconstructed = torch.abs(
+            reconstructed
+        )
+
+        freq_features = self.conv1x1(
+            reconstructed
+        )
 
         return freq_features
 
@@ -57,47 +73,51 @@ class FFTModule(nn.Module):
 
 class CASwin(nn.Module):
 
-    def __init__(
-            self,
-            embed_dim=512,
-            num_heads=8):
+    def __init__(self):
 
         super().__init__()
 
-        self.attn = nn.MultiheadAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            batch_first=True
+        self.window1 = SwinTransformerBlock(
+            dim=512,
+            input_resolution=(7,7),
+            num_heads=8,
+            window_size=7,
+            shift_size=0
         )
 
-        self.refine = nn.Conv2d(
-            embed_dim,
-            embed_dim,
-            kernel_size=1
+        self.window2 = SwinTransformerBlock(
+            dim=512,
+            input_resolution=(7,7),
+            num_heads=8,
+            window_size=7,
+            shift_size=3
         )
 
     def forward(self, x):
 
-        B, C, H, W = x.shape
+        B,C,H,W = x.shape
 
-        tokens = x.flatten(2).transpose(1, 2)
-
-        attn_out, _ = self.attn(
-            tokens,
-            tokens,
-            tokens
+        # BCHW → BHWC
+        x = x.permute(
+            0,
+            2,
+            3,
+            1
         )
 
-        attn_out = attn_out.transpose(1, 2)
+        x = self.window1(x)
 
-        attn_out = attn_out.reshape(
-            B, C, H, W
+        x = self.window2(x)
+
+        # BHWC → BCHW
+        x = x.permute(
+            0,
+            3,
+            1,
+            2
         )
 
-        attn_out = self.refine(attn_out)
-
-        return attn_out
-
+        return x
 
 # ==========================================================
 # CROSS ATTENTION
@@ -193,29 +213,77 @@ class FFT_CASwin_Classifier(nn.Module):
 
         super().__init__()
 
-        self.encoder = timm.create_model(
-            'swin_tiny_patch4_window7_224',
-            pretrained=True,
-            features_only=True
+        #=====================================
+        # RESNET18 BACKBONE
+        #=====================================
+
+        resnet = models.resnet18(
+            weights='DEFAULT'
         )
 
+        self.encoder = nn.Sequential(
+
+            resnet.conv1,
+            resnet.bn1,
+            resnet.relu,
+            resnet.maxpool,
+
+            resnet.layer1,
+            resnet.layer2,
+            resnet.layer3,
+            resnet.layer4
+        )
+
+        #=====================================
+        # FEATURE ALIGNMENT
+        #=====================================
+
         self.feature_projection = nn.Sequential(
+
             nn.Conv2d(
-                768,
+                512,
                 512,
                 kernel_size=1
             ),
+
             nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True)
+
+            nn.ReLU()
         )
 
-        #self.ca_swin = CASwin()
+        #=====================================
+        # ENABLE CA-SWIN
+        #=====================================
+
+        self.ca_swin = CASwin()
+
+        #=====================================
 
         self.fft_module = FFTModule()
 
         self.cross_attention = CrossAttention()
 
         self.fusion = FusionModule()
+
+        self.decoder = nn.Sequential(
+
+            nn.Conv2d(
+                512,
+                256,
+                kernel_size=3,
+                padding=1
+            ),
+
+            nn.BatchNorm2d(256),
+
+            nn.ReLU(),
+
+            nn.Conv2d(
+                256,
+                512,
+                kernel_size=1
+            )
+        )
 
         self.pool = nn.AdaptiveAvgPool2d(1)
 
@@ -231,28 +299,44 @@ class FFT_CASwin_Classifier(nn.Module):
             num_classes
         )
 
-    def forward(self, x):
+    def forward(self,x):
 
-        features = self.encoder(x)
+        #=========================
+        # RESNET
+        #=========================
 
-        spatial = features[-1]
-
-        spatial = spatial.permute(0, 3, 1, 2)
+        spatial = self.encoder(x)
 
         spatial = self.feature_projection(
             spatial
         )
 
-        #spatial = self.ca_swin(spatial)
+        #=========================
+        # CA-SWIN
+        #=========================
 
-        freq = self.fft_module(x)
+        spatial = self.ca_swin(
+            spatial
+        )
+
+        #=========================
+        # FFT
+        #=========================
+
+        freq = self.fft_module(
+            x
+        )
 
         freq = F.interpolate(
             freq,
             size=spatial.shape[2:],
-            mode='bilinear',
+            mode="bilinear",
             align_corners=False
         )
+
+        #=========================
+        # CROSS ATTENTION
+        #=========================
 
         attention = self.cross_attention(
             spatial,
@@ -265,23 +349,36 @@ class FFT_CASwin_Classifier(nn.Module):
             freq
         )
 
-        pooled = self.pool(fused)
+        fused = self.decoder(
+            fused
+        )
+
+        pooled = self.pool(
+            fused
+        )
 
         pooled = pooled.view(
             pooled.size(0),
             -1
         )
 
-        x = self.fc1(pooled)
+        x = self.fc1(
+            pooled
+        )
 
-        x = F.relu(x)
+        x = F.relu(
+            x
+        )
 
-        x = self.dropout(x)
+        x = self.dropout(
+            x
+        )
 
-        logits = self.fc2(x)
+        logits = self.fc2(
+            x
+        )
 
         return logits
-
 
 # ==========================================================
 # TEST
